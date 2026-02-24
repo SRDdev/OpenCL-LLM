@@ -1,39 +1,60 @@
-# OpenCL: Zero to Transformer 🤖
+# Genral Purpose GPU-Optimization : High-Performance Kernel Design
 
-## Objective
-To build a deep understanding of Heterogeneous Computing and Machine Learning optimization by implementing a Transformer model from scratch using raw OpenCL.
+> "I have been fascinated by the challenge of model optimization moving beyond standard libraries to understand how hardware actually executes math. This repository is my deep dive into the 'mechanics' of performance."
 
-## 🛠 Phase 1: The OpenCL Foundation
-*Goal: Understand the "boilerplate" and the hardware model.*
-1.  **Platform & Device Discovery:** Querying the host for available hardware (NVIDIA GPU, CPU, etc.).
-2.  **The Context & Command Queue:** Setting up the environment where work happens.
-3.  **Memory Management:** * Host (CPU) vs. Device (GPU) memory.
-    * Reading/Writing buffers.
-    * **Concept:** Global vs. Local (Cache) vs. Private memory.
-4.  **The Kernel:** Writing our first parallel function ("Worker").
+This repository is a technical exploration of optimizing compute-bound and memory-bound kernels for mobile and embedded GPUs using OpenCL. It documents a step-by-step progression from hardware profiling to the implementation of state-of-the-art fused kernels like **Flash Attention**.
 
-## 🧮 Phase 2: Parallel Math & Algorithms
-*Goal: Learn to "think" in parallel.*
-1.  **Vector Addition:** CPU vs. GPU implementation. 
-2.  **Parallel Reduction:** Summing arrays (handling concurrency and race conditions).
-3.  **Matrix Multiplication (GEMM):** * Naive implementation.
-    * Tiled implementation (using `local_cache` for speed).
-    * *This is the core engine of all Deep Learning.*
+## Objectives
 
-## 🧠 Phase 3: The Neural Building Blocks
-*Goal: Translate Math to ML layers.*
-1.  **Linear Layers:** Utilizing our Matrix Multiplication.
-2.  **Activation Functions:** Implementing ReLU/Softmax as kernels.
-3.  **The Backward Pass:** Calculating gradients (calculus in C++/OpenCL).
+The goal is to demonstrate sophisticated resource management on **Unified Memory Architectures (UMA)**. By treating the GPU as a precision instrument, this project implements optimizations that bypass the "Memory Wall" in modern AI workloads.
 
-## 🚀 Phase 4: The Transformer
-*Goal: The Final Boss.*
-1.  **Self-Attention Mechanism:** Implementing the $Q, K, V$ matrix logic.
-2.  **Feed Forward Network:** Connecting layers.
-3.  **Training Loop:** Updating weights on the GPU.
-4.  **Inference:** Running the model.
+## Project Roadmap
 
-## 📱 Phase 5: The Mobile Migration (Qualcomm)
-*Goal: Porting to the Edge.*
-1.  Adapting code for Snapdragon (Adreno GPU).
-2.  Optimization tips for mobile power/thermal constraints.
+| Phase | Milestone | Key Technical Achievement |
+| --- | --- | --- |
+| **I** | **Hardware Handshake** | Mapping the memory hierarchy: Host RAM vs. SRAM (Local) vs. Registers. |
+| **II** | **Tensor Foundations** | Implementation of robust Matrix Multiplication ($C = A \cdot B^T$) with arbitrary size handling. |
+| **III** | **The Tiling Leap** | Developing **Tiled MatMul** and a standard Attention pipeline ($Softmax(QK^T)V$). |
+| **IV** | **Kernel Fusion** | Implementing **Flash Attention 1 & 2** via Online Softmax and tiled accumulation. |
+
+---
+
+## Core Optimization Strategies
+
+### 1. Manual Cache Management
+
+Embedded GPUs often lack massive hardware-managed caches. This project focuses on **SRAM Tiling**—explicitly moving data into `__local` memory to serve as a software-managed cache, reducing high-latency Global Memory (DRAM) round-trips.
+
+### 2. Zero-Copy Orchestration
+
+On UMA systems, the CPU and GPU share physical silicon. We leverage page-aligned memory allocation to allow the GPU to operate directly on host-allocated pointers, removing the $O(N)$ latency and power cost of redundant memory copies.
+
+### 3. Fused Operator Design
+
+To solve the memory bottleneck in Attention mechanisms, we implement **Online Softmax**. This allows the kernel to compute normalization factors incrementally, enabling the fusion of multiple operations into a single, high-bandwidth GPU pass.
+
+---
+
+## Build & Run
+
+### Prerequisites
+
+* **OpenCL SDK** (Headers and ICD Loader).
+* **C++17** compatible compiler.
+* **CMake 3.10+**.
+
+### Execution
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+./cl_info  # Run Phase I hardware diagnostics
+
+```
+
+---
+
+## Why This Matters
+
+As AI models move toward edge devices, the primary bottleneck is rarely raw TFLOPS—it is **memory bandwidth**. This repository serves as a blueprint for writing "bandwidth-aware" kernels that ensure maximum throughput on power-constrained hardware.
