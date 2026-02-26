@@ -12,3 +12,5 @@ D:\MYSYS\ucrt64\bin\g++.exe -std=c++17 {path_to_cpp_file} -I D:\OpenCL-SDK\inclu
 
 # Example:
 # D:\MYSYS\ucrt64\bin\g++.exe -std=c++17 Phase_1\src\cl_info.cpp -I D:\OpenCL-SDK\include C:\Windows\System32\OpenCL.dll -o Phase_1\build\cl_info.exe
+
+D:\MYSYS\ucrt64\bin\g++.exe -std=c++17 Vector_Foundations\src\matmul.cpp -I D:\OpenCL-SDK\include C:\Windows\System32\OpenCL.dll -o Vector_Foundations\build\matmul.exe
