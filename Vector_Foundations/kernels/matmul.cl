@@ -42,3 +42,5 @@ __kernel void matmul(__global const float* A, __global const float* B, __global 
         C[row * N + col] = acc;
     }
 }
+
+
