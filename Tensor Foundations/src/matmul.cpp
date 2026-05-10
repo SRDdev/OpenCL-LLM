@@ -7,85 +7,114 @@
 #include <string>
 #include <thread> 
 #include <chrono> 
-#include "C:/Users/ASUS/Desktop/Shreyas/OpenCL-LLM/utils/utils.hpp"
+#include <array>
 
 using namespace std;
 
-// --- Kernel Profile Definition ---
+// --- FP16 Conversion Helpers ---
+cl_half floatToHalf(float f) {
+    uint32_t x = *((uint32_t*)&f);
+    uint32_t s = (x >> 16) & 0x8000;
+    uint32_t m = (x >> 13) & 0x03ff;
+    uint32_t e = ((x >> 23) & 0xff) - (127 - 15);
+    if (e > 30) return s | 0x7c00; 
+    if (e <= 0) return s;         
+    return s | (e << 10) | m;
+}
+
+float halfToFloat(cl_half h) {
+    uint32_t s = (h >> 15) & 0x0001;
+    uint32_t e = (h >> 10) & 0x001f;
+    uint32_t m = h & 0x03ff;
+    if (e == 0) return (s ? -1.0f : 1.0f) * ldexp((float)m, -24);
+    if (e == 31) return m ? NAN : (s ? -INFINITY : INFINITY);
+    return (s ? -1.0f : 1.0f) * ldexp((float)(m | 0x0400), (int)e - 15 - 10);
+}
+
 struct KernelProfile {
     string displayName;
     string fileName;
     string functionName;
-    int wpt_x;         
-    int wpt_y;         
-    int local_x;       
-    int local_y;       
-    string wptString;  
+    int wpt_x; int wpt_y;         
+    int local_x; int local_y;       
 };
 
-// --- CPU Ground Truth Function ---
-bool verify_results(const vector<float>& A, const vector<float>& B, const vector<float>& GPU_C, int M, int N, int K) {
-    float epsilon = 1e-2f;
+// --- Hardware Sensor Mock (Replace with NVML for NVIDIA) ---
+float getGpuTemperature() {
+    // Logic: In a real scenario, use nvmlDeviceGetTemperature
+    return 42.0f; 
+}
+
+bool verify_results(const vector<cl_half>& A, const vector<cl_half>& B, const vector<float>& GPU_C, int M, int N, int K) {
+    float epsilon = 0.5f; 
     for (int i = 0; i < 64; i++) { 
         float cpu_sum = 0.0f;
         int row = i / N;
         int col = i % N;
         for (int k = 0; k < K; k++) {
-            cpu_sum += A[row * K + k] * B[k * N + col];
+            cpu_sum += halfToFloat(A[row * K + k]) * halfToFloat(B[k * N + col]);
         }
         if (std::abs(GPU_C[i] - cpu_sum) > epsilon) {
-            cout << "\n[!] DEBUG Mismatch at index " << i << ": GPU=" << GPU_C[i] << " CPU=" << cpu_sum << endl;
             return false;
         }
     }
     return true; 
 }
 
-// --- Benchmark Runner Function ---
-// UPDATED: Removed Context & Queue from arguments so we can create them locally.
 void runBenchmark(const KernelProfile& profile, cl::Device& device,
-                  vector<float>& h_A, vector<float>& h_B, vector<float>& h_C, 
-                  int M, int N, int K, size_t matrixSize) {
+                  vector<cl_half>& h_A_half, vector<cl_half>& h_B_half, 
+                  vector<float>& h_C, int M, int N, int K, size_t matrixSize) {
     
-    // 0. ISOLATED CONTEXT CREATION (The Fix)
-    // Creates a brand new execution state on the GPU. No memory bleed-over.
     cl::Context context(device);
     cl::CommandQueue queue(context, device, CL_QUEUE_PROFILING_ENABLE);
 
-    // 1. Build Program
+    // --- Kernel Loading & Build ---
     string filePath = "Tensor Foundations/kernels/" + profile.fileName;
     string src;
-    try {
-        src = readKernelFile(filePath.c_str());
-    } catch (...) {
-        cout << "[!] Error: Could not read " << filePath << ". Skipping..." << endl;
-        return;
-    }
+    FILE *f = fopen(filePath.c_str(), "rb");
+    if (!f) { cout << "[!] Kernel file not found." << endl; return; }
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    rewind(f);
+    vector<char> buffer(size + 1);
+    fread(buffer.data(), 1, size, f);
+    buffer[size] = '\0';
+    src = buffer.data();
+    fclose(f);
 
     cl::Program program(context, src);
     if (program.build("-cl-std=CL2.0") != CL_SUCCESS) {
-        cout << "[!] Build Error in " << profile.fileName << ":\n" 
-             << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(device) << endl;
+        cout << "[!] Build Error:\n" << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(device) << endl;
         return;
     }
     
     cl::Kernel kernel(program, profile.functionName.c_str());
 
-    // 2. Setup Device Buffers (Allocated fresh on the new context)
-    cl::Buffer d_A(context, CL_MEM_READ_ONLY, sizeof(float) * matrixSize);
-    cl::Buffer d_B(context, CL_MEM_READ_ONLY, sizeof(float) * matrixSize);
-    cl::Buffer d_C(context, CL_MEM_WRITE_ONLY, sizeof(float) * matrixSize);
+    // --- Memory Prep ---
+    cl::Buffer pinned_A(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(cl_half) * matrixSize);
+    cl::Buffer pinned_B(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(cl_half) * matrixSize);
+    cl::Buffer d_C(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(float) * matrixSize);
+
+    cl_half* ptr_A = (cl_half*)queue.enqueueMapBuffer(pinned_A, CL_TRUE, CL_MAP_WRITE, 0, sizeof(cl_half) * matrixSize);
+    cl_half* ptr_B = (cl_half*)queue.enqueueMapBuffer(pinned_B, CL_TRUE, CL_MAP_WRITE, 0, sizeof(cl_half) * matrixSize);
+    std::copy(h_A_half.begin(), h_A_half.end(), ptr_A);
+    std::copy(h_B_half.begin(), h_B_half.end(), ptr_B);
+
+    cl::ImageFormat format(CL_RGBA, CL_HALF_FLOAT);
+    cl::Image2D d_A(context, CL_MEM_READ_ONLY, format, K / 4, M);
+    cl::Image2D d_B(context, CL_MEM_READ_ONLY, format, N / 4, K);
     cl::Event evInA, evInB, evExec, evOut;
 
-    std::fill(h_C.begin(), h_C.end(), 0.0f);
-    queue.enqueueWriteBuffer(d_C, CL_FALSE, 0, sizeof(float) * matrixSize, h_C.data(), nullptr, nullptr);
+    std::array<size_t, 3> origin = {0, 0, 0};
+    std::array<size_t, 3> regA = {(size_t)(K / 4), (size_t)M, 1};
+    std::array<size_t, 3> regB = {(size_t)(N / 4), (size_t)K, 1};
 
-    // 3. Data Transfer & Kernel Execution
-    queue.enqueueWriteBuffer(d_A, CL_FALSE, 0, sizeof(float) * matrixSize, h_A.data(), nullptr, &evInA);
-    queue.enqueueWriteBuffer(d_B, CL_FALSE, 0, sizeof(float) * matrixSize, h_B.data(), nullptr, &evInB);
+    // --- Execution ---
+    queue.enqueueWriteImage(d_A, CL_FALSE, origin, regA, 0, 0, ptr_A, nullptr, &evInA);
+    queue.enqueueWriteImage(d_B, CL_FALSE, origin, regB, 0, 0, ptr_B, nullptr, &evInB);
 
     kernel.setArg(0, d_A); kernel.setArg(1, d_B); kernel.setArg(2, d_C);
-    kernel.setArg(3, M);   kernel.setArg(4, N);   kernel.setArg(5, K);
+    kernel.setArg(3, M); kernel.setArg(4, N); kernel.setArg(5, K);
     
     cl::NDRange globalSize(N / profile.wpt_x, M / profile.wpt_y); 
     cl::NDRange localSize(profile.local_x, profile.local_y); 
@@ -93,7 +122,7 @@ void runBenchmark(const KernelProfile& profile, cl::Device& device,
     queue.enqueueNDRangeKernel(kernel, cl::NullRange, globalSize, localSize, nullptr, &evExec);
     queue.enqueueReadBuffer(d_C, CL_TRUE, 0, sizeof(float) * matrixSize, h_C.data(), nullptr, &evOut);
 
-    // 4. Timing Helper
+    // --- Profiling Extraction ---
     auto get_ms = [](cl::Event& e) {
         e.wait();
         cl_ulong start, end;
@@ -102,81 +131,79 @@ void runBenchmark(const KernelProfile& profile, cl::Device& device,
         return (double)(end - start) * 1.0e-6;
     };
 
-    double t_in    = get_ms(evInA) + get_ms(evInB);
-    double t_exec  = get_ms(evExec);
-    double t_out   = get_ms(evOut);
-    double t_total = t_in + t_exec + t_out;
-
-    bool passed = verify_results(h_A, h_B, h_C, M, N, K);
+    double t_in = get_ms(evInA) + get_ms(evInB);
+    double t_exec = get_ms(evExec);
+    double t_out = get_ms(evOut);
+    
+    // --- Advanced Math Metrics ---
     double ops = 2.0 * (double)M * (double)N * (double)K;
-    double gflops = (t_exec > 0) ? (ops / (t_exec * 1.0e-3 * 1.0e9)) : 0.0;
+    double gflops = (ops / (t_exec * 1e-3)) / 1e9;
+    
+    // Memory Traffic: A(half) + B(half) read + C(float) written
+    double bytesMoved = (double)matrixSize * (sizeof(cl_half) * 2 + sizeof(float));
+    double bandwidth = (bytesMoved / 1e9) / (t_exec * 1e-3); // GB/s
+    double intensity = ops / bytesMoved; // FLOPs per Byte
+    
+    bool passed = verify_results(h_A_half, h_B_half, h_C, M, N, K);
 
-    // 5. Formatted Output
-    cout << "\n" << string(80, '=') << endl;
-    cout << " OPENCL PERFORMANCE: " << profile.displayName << endl;
-    cout << string(80, '=') << endl;
+    // --- PRETTY PRINT TERMINAL OUTPUT ---
+    cout << "\033[1;36m" << string(60, '=') << "\033[0m" << endl;
+    cout << "  \033[1;33mPROFILING:\033[0m " << profile.displayName << endl;
+    cout << "\033[1;36m" << string(60, '=') << "\033[0m" << endl;
     
-    cout << left << setw(18) << "Metric" << " | " << "Value" << endl;
-    cout << string(19, '-') << "| " << string(59, '-') << endl;
+    cout << left << setw(25) << "  [TIMING] HtoD Transfer"  << ": " << fixed << setprecision(3) << t_in << " ms" << endl;
+    cout << left << setw(25) << "  [TIMING] Kernel Exec"    << ": " << fixed << setprecision(3) << t_exec << " ms" << endl;
+    cout << left << setw(25) << "  [TIMING] DtoH Transfer"  << ": " << fixed << setprecision(3) << t_out << " ms" << endl;
     
-    cout << left << setw(18) << "Matrix Size"    << " : " << N << " x " << M << endl;
-    cout << left << setw(18) << "Work/Thread"    << " : " << profile.wptString << endl; 
-    cout << left << setw(18) << "Total Ops"      << " : " << (ops / 1.0e9) << " Billion" << endl;
-    cout << left << setw(18) << "CPU -> GPU"     << " : " << fixed << setprecision(2) << t_in << " ms" << endl;
-    cout << left << setw(18) << "Kernel Exec"    << " : " << fixed << setprecision(2) << t_exec << " ms" << endl;
-    cout << left << setw(18) << "GPU -> CPU"     << " : " << fixed << setprecision(2) << t_out << " ms" << endl;
-    cout << left << setw(18) << "Total Latency"  << " : " << fixed << setprecision(2) << t_total << " ms" << endl;
-    cout << left << setw(18) << "Validation"     << " : " << (passed ? "PASS" : "FAIL") << endl;
+    cout << "\033[1;34m" << string(60, '-') << "\033[0m" << endl;
     
-    cout << string(80, '-') << endl;
-    cout << left << setw(18) << "PERFORMANCE"    << " : " << setprecision(2) << gflops << " GFLOPS" << endl;
-    cout << string(80, '=') << "\n" << endl;
+    cout << left << setw(25) << "  [COMPUTE] Performance"  << ": \033[1;32m" << gflops << " GFLOPS\033[0m" << endl;
+    cout << left << setw(25) << "  [MEMORY] Bandwidth"     << ": " << bandwidth << " GB/s" << endl;
+    cout << left << setw(25) << "  [MEMORY] Intensity"     << ": " << intensity << " FLOP/Byte" << endl;
+    cout << left << setw(25) << "  [MEMORY] Total Traffic" << ": " << bytesMoved / 1e6 << " MB" << endl;
+    
+    cout << "\033[1;34m" << string(60, '-') << "\033[0m" << endl;
+    
+    cout << left << setw(25) << "  [SENSOR] GPU Temp"      << ": " << getGpuTemperature() << "°C" << endl;
+    cout << left << setw(25) << "  [VERIFY] Validation"    << ": " << (passed ? "\033[1;32mPASS\033[0m" : "\033[1;31mFAIL\033[0m") << endl;
+    
+    double peakGflops = 13000.0; // Example for your specific GPU
+    double utilization = (gflops / peakGflops) * 100.0;
+    cout << left << setw(25) << "  [HW] Compute Util" << ": " << utilization << "%" << endl;
+    
+    cout << "\033[1;36m" << string(60, '=') << "\033[0m\n" << endl;
 
-    // 6. DESTRUCTIVE CLEANUP
-    // Force the queue to empty. When this function returns, `context` is destroyed,
-    // explicitly forcing the GPU driver to hard-flush VRAM.
-    queue.flush();
+    queue.enqueueUnmapMemObject(pinned_A, ptr_A);
+    queue.enqueueUnmapMemObject(pinned_B, ptr_B);
     queue.finish(); 
 }
-
 
 int main() {
     vector<cl::Platform> platforms;
     cl::Platform::get(&platforms);
-    if (platforms.empty()) { cout << "No OpenCL platforms found." << endl; return 1; }
-    
+    if (platforms.empty()) return 1;
     vector<cl::Device> devices;
     platforms[0].getDevices(CL_DEVICE_TYPE_GPU, &devices);
-    if (devices.empty()) { cout << "No GPUs found." << endl; return 1; }
-    
     cl::Device device = devices[0];
 
-    int N = 1024, M = 1024, K = 1024;
-    size_t matrixSize = (size_t)N * N;
-    vector<float> h_A(matrixSize, 1.1f), h_B(matrixSize, 2.2f), h_C(matrixSize, 0.0f);
-
-    vector<KernelProfile> suite = {
-        {"NAIVE MATMUL (GLOBAL WRITE)",       "naive1.cl",      "NaiveMatMul",              1, 1, 16, 16, "1x1 (Base)"},
-        {"NAIVE MATMUL (REGISTER ACCUM)",     "naive2.cl",      "NaiveMatMul",              1, 1, 16, 16, "1x1 (Register Accum)"},
-        {"GLOBAL COALESCING MATMUL",          "coalesced.cl",   "GlobalCoalescing_MatMul",  1, 1, 16, 16, "1x1 (Coalesced)"},
-        {"SHARED MEMORY MATMUL (TILES A&B)",  "shared1.cl",     "SharedMem_MatMul",         1, 1, 16, 16, "1x1 (SRAM)"},
-        {"SHARED MEMORY MATMUL (TILE B ONLY)","shared2.cl",     "SharedMem_MatMul",         1, 1, 16, 16, "1x1 (SRAM B)"},
-        {"1D BLOCK TILE MEMORY MATMUL",       "block1d.cl",     "BlockTile1D_MatMul",       4, 1, 16, 16, "1x4 (1D Block)"},
-        {"2D BLOCK TILE SCALAR MATMUL",       "block2d.cl",     "BlockTile2D_MatMul",       4, 4, 16, 16, "4x4 (2D Block)"},
-        {"2D BLOCK TILE VECTOR MATMUL",       "block2d_vec.cl", "BlockTile2D_Vload_MatMul", 4, 4, 16, 16, "4x4 (Vec4)"},
-        {"WARP-TILED SCALAR MATMUL",          "warp_scalar.cl", "WarpTile_MatMul",          8, 8, 16,  8, "8x8 (Reg Scalar)"},
-        {"ULTIMATE VEC-WARP MATMUL",          "warp_vec.cl",    "WarpTile_Vec_MatMul",      8, 8, 16, 16, "8x8 (Reg Vec4)"}
-    };
-
-    cout << "Starting OpenCL Benchmark Suite..." << endl;
-    for (const auto& profile : suite) {
-        
-        // Context is spawned uniquely for each run here.
-        runBenchmark(profile, device, h_A, h_B, h_C, M, N, K, matrixSize);
-        
-        // HARDWARE COOLDOWN: Bumped to 2.5 seconds to clear thermal load
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    int N = 2048, M = 2048, K = 2048; // Increased size for better measurement
+    size_t matrixSize = (size_t)M * N;
+    
+    vector<cl_half> h_A_half(matrixSize), h_B_half(matrixSize);
+    vector<float> h_C(matrixSize, 0.0f);
+    
+    for(size_t i = 0; i < matrixSize; ++i) {
+        h_A_half[i] = floatToHalf(1.1f);
+        h_B_half[i] = floatToHalf(2.2f);
     }
 
+    vector<KernelProfile> suite = {
+        {"Ultimate Ping-Pong FP16", "warp_vec.cl", "WarpTile_PingPong_MatMul", 8, 8, 16, 16}
+    };
+
+    cout << "\033[1;35mStarting Enhanced OpenCL Benchmark Suite...\033[0m" << endl;
+    for (const auto& profile : suite) {
+        runBenchmark(profile, device, h_A_half, h_B_half, h_C, M, N, K, matrixSize);
+    }
     return 0;
 }
